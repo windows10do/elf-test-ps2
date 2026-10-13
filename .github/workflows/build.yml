@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "**"
+    paths-ignore:
+      - "output/**"
   workflow_dispatch:
 
 permissions:
@@ -11,52 +13,74 @@ permissions:
 
 jobs:
   build:
-    name: Build PS2 ELF
+    name: Build PS2 Example ELF
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create missing project files
+      - name: Create project files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p src output
 
-          python3 - <<'PY'
-          from pathlib import Path
+          mkdir -p .github/workflows src output
 
-          files = {
-              ".gitignore": r"""# Generated compiler files
+          # Create .gitignore without replacing an existing one.
+          if [ ! -f .gitignore ]; then
+            cat > .gitignore <<'EOF'
           *.o
           /example.elf
-          """,
-              "README.md": r"""# PS2 Example ELF
+          EOF
+          fi
 
-          PS2SDK controller demo.
+          # Create README without replacing an existing one.
+          if [ ! -f README.md ]; then
+            cat > README.md <<'EOF'
+          # PS2 Example ELF
 
-          - Circle: open the menu.
-          - Cross: open the QWERTY keyboard or activate the selected key.
-          - D-pad: navigate menus and keyboard keys.
-          - Triangle: return to the main screen from any menu.
+          PlayStation 2 homebrew demo built with PS2SDK.
 
-          The workflow builds and commits `output/example.elf` to this repository.
-          """,
-              "Makefile": r"""# PS2_EXAMPLE_ELF_V2
+          ## Controls
+
+          - Circle: Open the menu.
+          - Cross: Open the keyboard or select a key.
+          - D-pad: Navigate menus and the QWERTY keyboard.
+          - Triangle: Return to the main screen from any menu.
+
+          ## Build output
+
+          The ELF is committed to:
+
+          `output/example.elf`
+
+          GitHub Actions builds the ELF and commits it directly
+          to the repository.
+          EOF
+          fi
+
+          # Replace the generated Makefile so old broken settings
+          # do not carry over from previous workflow attempts.
+          cat > Makefile <<'EOF'
           EE_BIN = example.elf
           EE_OBJS = src/main.o
-          EE_LIBS = -lpad -ldebug
-          EE_CFLAGS += -O2 -G0 -Wall -Wextra
+          EE_LIBS = -ldebug -lpad
+          EE_CFLAGS += -O2 -Wall -Wextra -G0
 
           all: $(EE_BIN)
 
+          clean:
+          	rm -f $(EE_OBJS) $(EE_BIN)
+
           include $(PS2SDK)/samples/Makefile.pref
           include $(PS2SDK)/samples/Makefile.eeglobal
-          """,
-              "src/main.c": r"""/* PS2_EXAMPLE_ELF_V2 */
+          EOF
+
+          # Generate the complete PS2 application.
+          cat > src/main.c <<'EOF'
           #include <tamtypes.h>
           #include <kernel.h>
           #include <sifrpc.h>
@@ -65,23 +89,28 @@ jobs:
           #include <debug.h>
           #include <string.h>
 
-          #define HOME_SCREEN 0
-          #define MENU_SCREEN 1
-          #define KEYBOARD_SCREEN 2
+          #define SCREEN_HOME 0
+          #define SCREEN_MENU 1
+          #define SCREEN_KEYBOARD 2
+
           #define TEXT_CAPACITY 64
 
-          static unsigned char pad_buffer[256] __attribute__((aligned(64)));
-          static int screen_mode = HOME_SCREEN;
+          static unsigned char pad_buffer[256]
+              __attribute__((aligned(64)));
+
+          static int screen = SCREEN_HOME;
           static int menu_selection = 0;
+
           static int key_row = 0;
           static int key_column = 0;
+
           static char text_field[TEXT_CAPACITY];
           static int text_length = 0;
 
           static const char *menu_items[] = {
               "Open QWERTY keyboard",
               "Clear text field",
-              "Close menu"
+              "Return home"
           };
 
           static const char *keyboard_rows[] = {
@@ -90,20 +119,32 @@ jobs:
               "zxcvbnm"
           };
 
-          static const int keyboard_row_lengths[] = {10, 9, 7, 3};
-          static const char *keyboard_actions[] = {"SPACE", "DEL", "DONE"};
+          static const int keyboard_lengths[] = {
+              10, 9, 7, 3
+          };
+
+          static const char *keyboard_actions[] = {
+              "SPACE", "DEL", "DONE"
+          };
 
           static void draw_home(void)
           {
               scr_clear();
               scr_setXY(0, 0);
+
               scr_printf("Hello from example elf!\n\n");
+
               scr_printf("PS2 EXAMPLE ELF\n\n");
-              scr_printf("Text field: %s\n\n", text_length ? text_field : "<empty>");
+
+              scr_printf("TEXT FIELD:\n");
+              scr_printf("> %s\n\n",
+                  text_length > 0 ? text_field : "<empty>");
+
               scr_printf("CIRCLE  - Open menu\n");
               scr_printf("CROSS   - Open QWERTY keyboard\n");
-              scr_printf("TRIANGLE - Return to this screen\n\n");
-              scr_printf("Built with PS2SDK and GitHub Actions.\n");
+              scr_printf("TRIANGLE - Return home\n\n");
+
+              scr_printf("Built with PS2SDK.\n");
           }
 
           static void draw_menu(void)
@@ -112,38 +153,53 @@ jobs:
 
               scr_clear();
               scr_setXY(0, 0);
+
               scr_printf("EXAMPLE MENU\n\n");
 
-              for (i = 0; i < 3; ++i)
+              for (i = 0; i < 3; i++) {
                   scr_printf("%c %s\n",
-                             i == menu_selection ? '>' : ' ',
-                             menu_items[i]);
+                      i == menu_selection ? '>' : ' ',
+                      menu_items[i]);
+              }
 
-              scr_printf("\nD-PAD - Navigate\n");
+              scr_printf("\n");
+              scr_printf("D-PAD - Navigate\n");
               scr_printf("CROSS - Select\n");
               scr_printf("TRIANGLE - Main screen\n");
           }
 
           static void draw_keyboard(void)
           {
-              int row, col;
+              int row;
+              int col;
 
               scr_clear();
               scr_setXY(0, 0);
+
               scr_printf("QWERTY KEYBOARD\n\n");
-              scr_printf("Text field: %s\n\n", text_field);
 
-              for (row = 0; row < 3; ++row) {
-                  int indent = row == 0 ? 0 : (row == 1 ? 2 : 5);
+              scr_printf("TEXT FIELD:\n");
+              scr_printf("> %s\n\n", text_field);
 
-                  for (col = 0; col < indent; ++col)
+              for (row = 0; row < 3; row++) {
+                  int indent = row == 0 ? 0 :
+                               row == 1 ? 2 : 5;
+
+                  for (col = 0; col < indent; col++)
                       scr_printf(" ");
 
-                  for (col = 0; col < keyboard_row_lengths[row]; ++col) {
-                      if (row == key_row && col == key_column)
-                          scr_printf("[%c] ", keyboard_rows[row][col]);
-                      else
-                          scr_printf(" %c  ", keyboard_rows[row][col]);
+                  for (col = 0;
+                       col < keyboard_lengths[row];
+                       col++) {
+
+                      if (row == key_row &&
+                          col == key_column) {
+                          scr_printf("[%c] ",
+                              keyboard_rows[row][col]);
+                      } else {
+                          scr_printf(" %c  ",
+                              keyboard_rows[row][col]);
+                      }
                   }
 
                   scr_printf("\n");
@@ -151,82 +207,99 @@ jobs:
 
               scr_printf("\n");
 
-              for (col = 0; col < 3; ++col) {
-                  if (key_row == 3 && key_column == col)
-                      scr_printf("[%s]  ", keyboard_actions[col]);
-                  else
-                      scr_printf(" %s   ", keyboard_actions[col]);
+              for (col = 0; col < 3; col++) {
+                  if (key_row == 3 &&
+                      key_column == col) {
+                      scr_printf("[%s] ",
+                          keyboard_actions[col]);
+                  } else {
+                      scr_printf(" %s  ",
+                          keyboard_actions[col]);
+                  }
               }
 
-              scr_printf("\n\nD-PAD - Move  CROSS - Choose\n");
+              scr_printf("\n\n");
+              scr_printf("D-PAD - Navigate\n");
+              scr_printf("CROSS - Type/select\n");
               scr_printf("TRIANGLE - Main screen\n");
           }
 
-          static void redraw_screen(void)
+          static void redraw(void)
           {
-              if (screen_mode == HOME_SCREEN)
+              if (screen == SCREEN_HOME)
                   draw_home();
-              else if (screen_mode == MENU_SCREEN)
+              else if (screen == SCREEN_MENU)
                   draw_menu();
               else
                   draw_keyboard();
           }
 
-          static void append_character(char value)
+          static void append_character(char ch)
           {
               if (text_length < TEXT_CAPACITY - 1) {
-                  text_field[text_length++] = value;
+                  text_field[text_length] = ch;
+                  text_length++;
                   text_field[text_length] = '\0';
               }
           }
 
           static void update_menu(u32 pressed)
           {
-              if (pressed & PAD_UP)
-                  menu_selection = (menu_selection + 2) % 3;
+              if (pressed & PAD_UP) {
+                  menu_selection =
+                      (menu_selection + 2) % 3;
+              }
 
-              if (pressed & PAD_DOWN)
-                  menu_selection = (menu_selection + 1) % 3;
+              if (pressed & PAD_DOWN) {
+                  menu_selection =
+                      (menu_selection + 1) % 3;
+              }
 
               if (pressed & PAD_CROSS) {
                   if (menu_selection == 0) {
-                      screen_mode = KEYBOARD_SCREEN;
+                      screen = SCREEN_KEYBOARD;
                       key_row = 0;
                       key_column = 0;
                   } else if (menu_selection == 1) {
                       text_length = 0;
                       text_field[0] = '\0';
                   } else {
-                      screen_mode = HOME_SCREEN;
+                      screen = SCREEN_HOME;
                   }
               }
           }
 
           static void update_keyboard(u32 pressed)
           {
-              if (pressed & PAD_LEFT)
+              if (pressed & PAD_LEFT) {
                   key_column =
-                      (key_column + keyboard_row_lengths[key_row] - 1)
-                      % keyboard_row_lengths[key_row];
+                      (key_column +
+                       keyboard_lengths[key_row] - 1)
+                      % keyboard_lengths[key_row];
+              }
 
-              if (pressed & PAD_RIGHT)
+              if (pressed & PAD_RIGHT) {
                   key_column =
-                      (key_column + 1) % keyboard_row_lengths[key_row];
+                      (key_column + 1)
+                      % keyboard_lengths[key_row];
+              }
 
               if (pressed & PAD_UP) {
                   if (key_row > 0)
-                      --key_row;
+                      key_row--;
 
-                  if (key_column >= keyboard_row_lengths[key_row])
-                      key_column = keyboard_row_lengths[key_row] - 1;
+                  if (key_column >= keyboard_lengths[key_row])
+                      key_column =
+                          keyboard_lengths[key_row] - 1;
               }
 
               if (pressed & PAD_DOWN) {
                   if (key_row < 3)
-                      ++key_row;
+                      key_row++;
 
-                  if (key_column >= keyboard_row_lengths[key_row])
-                      key_column = keyboard_row_lengths[key_row] - 1;
+                  if (key_column >= keyboard_lengths[key_row])
+                      key_column =
+                          keyboard_lengths[key_row] - 1;
               }
 
               if (pressed & PAD_CROSS) {
@@ -237,10 +310,12 @@ jobs:
                   } else if (key_column == 0) {
                       append_character(' ');
                   } else if (key_column == 1) {
-                      if (text_length > 0)
-                          text_field[--text_length] = '\0';
+                      if (text_length > 0) {
+                          text_length--;
+                          text_field[text_length] = '\0';
+                      }
                   } else {
-                      screen_mode = HOME_SCREEN;
+                      screen = SCREEN_HOME;
                   }
               }
           }
@@ -249,140 +324,158 @@ jobs:
           {
               struct padButtonStatus buttons;
               u32 previous_buttons = 0;
-              int redraw = 1;
 
+              /* Initialize RPC and reset the IOP. */
               SifInitRpc(0);
 
-              while (!SifIopReset("", 0)) { }
-              while (!SifIopSync()) { }
+              while (!SifIopReset("", 0)) {
+              }
+
+              while (!SifIopSync()) {
+              }
 
               SifInitRpc(0);
               SifLoadFileInit();
 
+              /* Load controller drivers from ROM. */
               SifLoadModule("rom0:SIO2MAN", 0, NULL);
               SifLoadModule("rom0:PADMAN", 0, NULL);
 
               padInit(0);
               padPortOpen(0, 0, pad_buffer);
 
+              /* Initialize the PS2 debug text display. */
               init_scr();
               scr_setCursor(0);
 
+              redraw();
+
               for (;;) {
-                  u32 held_buttons = 0;
-                  u32 pressed_buttons;
+                  u32 current_buttons = 0;
+                  u32 pressed;
 
                   if (padGetState(0, 0) == PAD_STATE_STABLE &&
                       padRead(0, 0, &buttons) != 0) {
-                      held_buttons = ((u32)(~buttons.btns)) & 0xFFFF;
+                      current_buttons =
+                          ((u32)(~buttons.btns)) & 0xFFFF;
                   }
 
-                  pressed_buttons = held_buttons & ~previous_buttons;
-                  previous_buttons = held_buttons;
+                  /* Detect newly pressed buttons. */
+                  pressed =
+                      current_buttons & ~previous_buttons;
 
-                  /* Triangle returns home from every menu. */
-                  if (pressed_buttons & PAD_TRIANGLE) {
-                      screen_mode = HOME_SCREEN;
-                      redraw = 1;
-                  } else if (screen_mode == HOME_SCREEN) {
-                      if (pressed_buttons & PAD_CIRCLE) {
-                          screen_mode = MENU_SCREEN;
+                  previous_buttons = current_buttons;
+
+                  /*
+                   * Triangle returns to the main screen
+                   * from every menu.
+                   */
+                  if (pressed & PAD_TRIANGLE) {
+                      screen = SCREEN_HOME;
+                      redraw();
+                      continue;
+                  }
+
+                  if (screen == SCREEN_HOME) {
+                      if (pressed & PAD_CIRCLE) {
+                          screen = SCREEN_MENU;
                           menu_selection = 0;
-                          redraw = 1;
-                      } else if (pressed_buttons & PAD_CROSS) {
-                          screen_mode = KEYBOARD_SCREEN;
+                          redraw();
+                      } else if (pressed & PAD_CROSS) {
+                          screen = SCREEN_KEYBOARD;
                           key_row = 0;
                           key_column = 0;
-                          redraw = 1;
+                          redraw();
                       }
-                  } else if (screen_mode == MENU_SCREEN) {
-                      update_menu(pressed_buttons);
+                  } else if (screen == SCREEN_MENU) {
+                      update_menu(pressed);
 
-                      if (pressed_buttons & (PAD_UP | PAD_DOWN | PAD_CROSS))
-                          redraw = 1;
+                      if (pressed &
+                          (PAD_UP | PAD_DOWN | PAD_CROSS)) {
+                          redraw();
+                      }
                   } else {
-                      update_keyboard(pressed_buttons);
+                      update_keyboard(pressed);
 
-                      if (pressed_buttons &
-                          (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_CROSS))
-                          redraw = 1;
-                  }
-
-                  if (redraw) {
-                      redraw_screen();
-                      redraw = 0;
+                      if (pressed &
+                          (PAD_UP | PAD_DOWN |
+                           PAD_LEFT | PAD_RIGHT |
+                           PAD_CROSS)) {
+                          redraw();
+                      }
                   }
               }
 
               return 0;
           }
-          """,
-          }
+          EOF
 
-          for name, content in files.items():
-              path = Path(name)
-              path.parent.mkdir(parents=True, exist_ok=True)
+          echo "Project files created."
 
-              needs_write = not path.exists()
-
-              # Replace the older generated source and Makefile if present.
-              if name in ("Makefile", "src/main.c") and path.exists():
-                  needs_write = (
-                      "PS2_EXAMPLE_ELF_V2"
-                      not in path.read_text(
-                          encoding="utf-8",
-                          errors="replace"
-                      )
-                  )
-
-              if needs_write:
-                  path.write_text(
-                      content.lstrip("\n"),
-                      encoding="utf-8"
-                  )
-                  print(f"Created/repaired {name}")
-              else:
-                  print(f"Kept existing {name}")
-
-          PY
-
-      - name: Build ELF with PS2DEV container
+      - name: Download PS2DEV toolchain
         shell: bash
         run: |
           set -euo pipefail
 
-          docker pull ghcr.io/ps2dev/ps2dev:v2.0.0
+          docker pull ghcr.io/ps2dev/ps2dev:latest
+
+      - name: Diagnose tools and build ELF
+        shell: bash
+        run: |
+          set -euo pipefail
 
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" \
+            -v "${GITHUB_WORKSPACE}:/src" \
             -w /src \
-            ghcr.io/ps2dev/ps2dev:v2.0.0 \
-            sh -c '
-              set -eu
+            --entrypoint /bin/sh \
+            ghcr.io/ps2dev/ps2dev:latest \
+            -eu -c '
+              echo "=== Installing build dependencies ==="
+
+              apk add --no-cache build-base
+
+              echo "=== Toolchain ==="
 
               export PS2DEV="${PS2DEV:-/usr/local/ps2dev}"
               export PS2SDK="${PS2SDK:-$PS2DEV/ps2sdk}"
               export PATH="$PATH:$PS2DEV/bin:$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2DEV/dvp/bin:$PS2SDK/bin"
 
+              echo "PS2DEV=$PS2DEV"
+              echo "PS2SDK=$PS2SDK"
+
+              command -v make
               command -v mips64r5900el-ps2-elf-gcc
+
               test -f "$PS2SDK/samples/Makefile.pref"
+              test -f "$PS2SDK/samples/Makefile.eeglobal"
+
+              echo "=== Building ==="
 
               rm -f src/main.o example.elf
+
               make
+
+              echo "=== Verifying ELF ==="
 
               test -s example.elf
 
               mkdir -p output
               cp example.elf output/example.elf
+
+              test -s output/example.elf
+
+              echo "Build successful."
+              ls -lh output/example.elf
             '
 
-      - name: Commit project files and output/example.elf
+      - name: Commit project files and ELF
         shell: bash
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -f -- \
             .github/workflows/build.yml \
@@ -398,4 +491,5 @@ jobs:
           fi
 
           git commit -m "Build PS2 example ELF [skip ci]"
+
           git push origin "HEAD:${GITHUB_REF_NAME}"
