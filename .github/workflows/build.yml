@@ -1,0 +1,479 @@
+
+name: Build and Commit PS2 Example ELF
+
+on:
+  push:
+    paths-ignore:
+      - "output/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build PS2 ELF and commit project files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create missing project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src output
+
+          if [ ! -f .gitignore ]; then
+            cat > .gitignore <<'EOF'
+          *.o
+          example.elf
+          EOF
+          fi
+
+          if [ ! -f README.md ]; then
+            cat > README.md <<'EOF'
+          # PS2 Example ELF
+
+          PlayStation 2 homebrew controller demo.
+
+          ## Controls
+
+          - Circle: Open the menu.
+          - Cross: Open the QWERTY keyboard or select a key.
+          - D-pad: Navigate menus and keyboard.
+          - Triangle: Return to the main screen.
+
+          ## Output
+
+          `output/example.elf`
+
+          The ELF is built by GitHub Actions and committed to this repository.
+          EOF
+          fi
+
+          if [ ! -f Makefile ]; then
+            cat > Makefile <<'EOF'
+          EE_BIN = example.elf
+          EE_OBJS = src/main.o
+
+          EE_CFLAGS += -O2 -Wall -Wextra -G0
+          EE_INCS += -I$(GSKIT)/include
+          EE_LIBS += -lgskit -ldmakit -lpad
+
+          all: $(EE_BIN)
+
+          clean:
+         	 rm -f $(EE_OBJS) $(EE_BIN)
+
+          include $(PS2SDK)/samples/Makefile.pref
+          include $(PS2SDK)/samples/Makefile.eeglobal
+          EOF
+          fi
+
+          if [ ! -f src/main.c ]; then
+            cat > src/main.c <<'EOF'
+          #include <tamtypes.h>
+          #include <kernel.h>
+          #include <sifrpc.h>
+          #include <libpad.h>
+          #include <gsKit.h>
+          #include <dmaKit.h>
+          #include <string.h>
+
+          #define COLOR(r,g,b) GS_SETREG_RGBAQ(r,g,b,0x80,0)
+          #define BG       COLOR(8,14,28)
+          #define PANEL    COLOR(22,34,55)
+          #define KEY      COLOR(34,49,70)
+          #define ACCENT   COLOR(45,130,230)
+          #define WHITE    COLOR(245,248,255)
+          #define MUTED    COLOR(160,180,205)
+
+          #define HOME 0
+          #define MENU 1
+          #define KEYBOARD 2
+          #define TEXT_CAP 40
+
+          static GSGLOBAL *gs;
+          static unsigned char pad_area[256] __attribute__((aligned(64)));
+          static char text[TEXT_CAP];
+          static int text_len;
+          static int mode = HOME;
+          static int menu_sel;
+          static int key_row, key_col;
+
+          static const char font_chars[] =
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.:-/ ";
+
+          /* Five rows, three pixels wide per character. */
+          static const unsigned char font[43][5] = {
+              {2,5,7,5,5}, {6,5,6,5,6}, {3,4,4,4,3},
+              {6,5,5,5,6}, {7,4,6,4,7}, {7,4,6,4,4},
+              {3,4,5,5,3}, {5,5,7,5,5}, {7,2,2,2,7},
+              {1,1,1,5,2}, {5,5,6,5,5}, {4,4,4,4,7},
+              {5,7,7,5,5}, {5,7,7,7,5}, {2,5,5,5,2},
+              {6,5,6,4,4}, {2,5,5,7,3}, {6,5,6,5,5},
+              {3,4,2,1,6}, {7,2,2,2,2}, {5,5,5,5,7},
+              {5,5,5,5,2}, {5,5,7,7,5}, {5,5,2,5,5},
+              {5,5,2,2,2}, {7,1,2,4,7},
+              {7,5,5,5,7}, {2,6,2,2,7}, {6,1,2,4,7},
+              {6,1,2,1,6}, {5,5,7,1,1}, {7,4,6,1,6},
+              {3,4,7,5,7}, {7,1,2,2,2}, {7,5,7,5,7},
+              {7,5,7,1,6},
+              {2,2,2,0,2}, {6,1,2,0,2}, {0,0,0,0,2},
+              {0,2,0,2,0}, {0,0,7,0,0}, {1,1,2,4,4},
+              {0,0,0,0,0}
+          };
+
+          static void rect(float x1, float y1, float x2, float y2,
+                           u64 color)
+          {
+              gsKit_prim_sprite(gs, x1, y1, x2, y2, 1, color);
+          }
+
+          static void draw_text(float x, float y, const char *s,
+                                int scale, u64 color)
+          {
+              int i, row, col, index;
+              char c;
+
+              while (*s) {
+                  c = *s++;
+                  if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
+
+                  for (index = 0; index < 43; index++)
+                      if (font_chars[index] == c) break;
+
+                  if (index < 43) {
+                      for (row = 0; row < 5; row++)
+                          for (col = 0; col < 3; col++)
+                              if (font[index][row] & (1 << (2 - col)))
+                                  rect(x + col * scale,
+                                       y + row * scale,
+                                       x + (col + 1) * scale,
+                                       y + (row + 1) * scale,
+                                       color);
+                  }
+                  x += 4 * scale;
+              }
+          }
+
+          static void centered(int cx, int y, const char *s,
+                               int scale, u64 color)
+          {
+              draw_text(cx - ((int)strlen(s) * 4 * scale) / 2,
+                        y, s, scale, color);
+          }
+
+          static void begin_screen(void)
+          {
+              gsKit_clear(gs, BG);
+          }
+
+          static void home_screen(void)
+          {
+              char preview[48];
+              int i;
+
+              begin_screen();
+              centered(320, 38, "EXAMPLE ELF", 4, ACCENT);
+              centered(320, 103, "Hello from example elf!", 3, WHITE);
+
+              rect(40, 150, 600, 207, PANEL);
+
+              if (!text_len) {
+                  draw_text(55, 173, "TEXT FIELD IS EMPTY", 3, MUTED);
+              } else {
+                  strcpy(preview, "TEXT: ");
+                  for (i = 0; i < text_len; i++)
+                      preview[6 + i] = text[i];
+                  preview[6 + i] = '\0';
+                  draw_text(55, 173, preview, 2, WHITE);
+              }
+
+              draw_text(55, 248, "CIRCLE: OPEN MENU", 3, ACCENT);
+              draw_text(55, 285, "CROSS: QWERTY KEYBOARD", 3, WHITE);
+              draw_text(55, 322, "TRIANGLE: RETURN HOME", 3, MUTED);
+          }
+
+          static const char *menu_items[] = {
+              "OPEN KEYBOARD", "CLEAR TEXT", "CLOSE MENU"
+          };
+
+          static void menu_screen(void)
+          {
+              int i;
+
+              begin_screen();
+              centered(320, 55, "EXAMPLE MENU", 4, ACCENT);
+
+              for (i = 0; i < 3; i++) {
+                  int y = 145 + i * 70;
+                  rect(110, y, 530, y + 48,
+                       i == menu_sel ? ACCENT : PANEL);
+                  centered(320, y + 18, menu_items[i], 3,
+                           WHITE);
+              }
+
+              centered(320, 380, "DPAD: MOVE CROSS: SELECT", 2, MUTED);
+              centered(320, 405, "TRIANGLE: HOME", 2, WHITE);
+          }
+
+          static const char *rows[] = {
+              "qwertyuiop", "asdfghjkl", "zxcvbnm"
+          };
+          static const int row_len[] = {10, 9, 7, 3};
+          static const char *bottom[] = {"SPACE", "DEL", "DONE"};
+
+          static float key_x(int row, int col)
+          {
+              if (row == 0) return 55 + col * 52;
+              if (row == 1) return 81 + col * 52;
+              if (row == 2) return 133 + col * 52;
+              if (col == 0) return 125;
+              if (col == 1) return 276;
+              return 414;
+          }
+
+          static float key_width(int row, int col)
+          {
+              if (row < 3) return 46;
+              if (col == 0) return 135;
+              if (col == 1) return 112;
+              return 105;
+          }
+
+          static void keyboard_screen(void)
+          {
+              int r, c;
+              const int ys[] = {174, 222, 270, 318};
+
+              begin_screen();
+              centered(320, 24, "QWERTY KEYBOARD", 3, ACCENT);
+              draw_text(45, 58, "TEXT FIELD", 2, MUTED);
+              rect(40, 75, 600, 130, PANEL);
+              draw_text(52, 96, text, 3, WHITE);
+
+              for (r = 0; r < 4; r++) {
+                  for (c = 0; c < row_len[r]; c++) {
+                      float x = key_x(r, c);
+                      float w = key_width(r, c);
+                      int selected = r == key_row && c == key_col;
+                      char letter[2];
+                      const char *label;
+
+                      rect(x, ys[r], x + w, ys[r] + 36,
+                           selected ? ACCENT : KEY);
+
+                      if (r < 3) {
+                          letter[0] = rows[r][c];
+                          letter[1] = '\0';
+                          label = letter;
+                      } else {
+                          label = bottom[c];
+                      }
+
+                      centered((int)(x + w / 2), ys[r] + 12,
+                               label, r == 3 ? 2 : 3,
+                               WHITE);
+                  }
+              }
+
+              centered(320, 379, "DPAD: MOVE CROSS: TYPE", 2, MUTED);
+              centered(320, 406, "TRIANGLE: HOME", 2, WHITE);
+          }
+
+          static void append_char(char c)
+          {
+              if (text_len < TEXT_CAP - 1) {
+                  text[text_len++] = c;
+                  text[text_len] = '\0';
+              }
+          }
+
+          static void keyboard_update(u32 pressed)
+          {
+              if (pressed & PAD_LEFT)
+                  key_col = (key_col + row_len[key_row] - 1)
+                            % row_len[key_row];
+
+              if (pressed & PAD_RIGHT)
+                  key_col = (key_col + 1) % row_len[key_row];
+
+              if (pressed & PAD_UP) {
+                  if (key_row > 0) key_row--;
+                  if (key_col >= row_len[key_row])
+                      key_col = row_len[key_row] - 1;
+              }
+
+              if (pressed & PAD_DOWN) {
+                  if (key_row < 3) key_row++;
+                  if (key_col >= row_len[key_row])
+                      key_col = row_len[key_row] - 1;
+              }
+
+              if (pressed & PAD_CROSS) {
+                  if (key_row < 3) {
+                      append_char(rows[key_row][key_col]);
+                  } else if (key_col == 0) {
+                      append_char(' ');
+                  } else if (key_col == 1) {
+                      if (text_len > 0)
+                          text[--text_len] = '\0';
+                  } else {
+                      mode = HOME;
+                  }
+              }
+          }
+
+          static void menu_update(u32 pressed)
+          {
+              if (pressed & PAD_UP)
+                  menu_sel = (menu_sel + 2) % 3;
+              if (pressed & PAD_DOWN)
+                  menu_sel = (menu_sel + 1) % 3;
+
+              if (pressed & PAD_CROSS) {
+                  if (menu_sel == 0) {
+                      mode = KEYBOARD;
+                      key_row = key_col = 0;
+                  } else if (menu_sel == 1) {
+                      text_len = 0;
+                      text[0] = '\0';
+                  } else {
+                      mode = HOME;
+                  }
+              }
+          }
+
+          int main(void)
+          {
+              struct padButtonStatus buttons;
+              u32 previous = 0;
+
+              sceSifInitRpc(0);
+
+              dmaKit_init(D_CTRL_RELE_OFF, D_CTRL_MFD_OFF,
+                          D_CTRL_STS_UNSPEC, D_CTRL_STD_OFF,
+                          D_CTRL_RCYC_8, 1 << DMA_CHANNEL_GIF);
+              dmaKit_chan_init(DMA_CHANNEL_GIF);
+
+              gs = gsKit_init_global();
+              gs->PSM = GS_PSM_CT32;
+              gs->PSMZ = GS_PSMZ_16S;
+              gs->ZBuffering = GS_SETTING_OFF;
+              gsKit_init_screen(gs);
+              gsKit_set_test(gs, GS_ZTEST_OFF);
+              gsKit_mode_switch(gs, GS_PERSISTENT);
+
+              padInit(0);
+              padPortOpen(0, 0, pad_area);
+
+              for (;;) {
+                  u32 current = 0, pressed;
+
+                  if (padGetState(0, 0) == PAD_STATE_STABLE &&
+                      padRead(0, 0, &buttons) != 0)
+                      current = 0xFFFFu ^ buttons.btns;
+
+                  pressed = current & ~previous;
+                  previous = current;
+
+                  /* Triangle always returns to the main screen. */
+                  if (pressed & PAD_TRIANGLE) {
+                      mode = HOME;
+                  } else if (mode == HOME) {
+                      if (pressed & PAD_CIRCLE) {
+                          mode = MENU;
+                          menu_sel = 0;
+                      } else if (pressed & PAD_CROSS) {
+                          mode = KEYBOARD;
+                          key_row = key_col = 0;
+                      }
+                  } else if (mode == MENU) {
+                      menu_update(pressed);
+                  } else {
+                      keyboard_update(pressed);
+                  }
+
+                  if (mode == HOME) home_screen();
+                  else if (mode == MENU) menu_screen();
+                  else keyboard_screen();
+
+                  gsKit_queue_exec(gs);
+                  gsKit_sync_flip(gs);
+              }
+
+              return 0;
+          }
+          EOF
+          fi
+
+      - name: Download PS2DEV toolchain
+        run: docker pull ghcr.io/ps2dev/ps2dev:latest
+
+      - name: Build the ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            ghcr.io/ps2dev/ps2dev:latest \
+            bash -lc '
+              set -eu
+
+              if [ -z "${PS2DEV:-}" ]; then
+                for d in /usr/local/ps2dev /opt/ps2dev /ps2dev; do
+                  if [ -d "$d/ps2sdk" ]; then
+                    PS2DEV="$d"
+                    break
+                  fi
+                done
+              fi
+
+              : "${PS2DEV:?PS2DEV toolchain directory not found}"
+
+              export PS2SDK="${PS2SDK:-$PS2DEV/ps2sdk}"
+              export GSKIT="${GSKIT:-$PS2DEV/gsKit}"
+              export PATH="$PS2DEV/bin:$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2SDK/bin:$PATH"
+
+              test -f "$PS2SDK/samples/Makefile.pref"
+              command -v mips64r5900el-ps2-elf-gcc
+
+              make clean
+              make
+            '
+
+          mkdir -p output
+          test -s example.elf
+          cp example.elf output/example.elf
+
+      - name: Commit all project files and ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            .github/workflows/build.yml \
+            .gitignore \
+            README.md \
+            Makefile \
+            src/main.c
+
+          git add -f output/example.elf
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Build PS2 example ELF [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
